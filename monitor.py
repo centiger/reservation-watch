@@ -12,7 +12,7 @@ async def inspect(browser,site):
     result={'name':site.get('name',''),'date':site.get('date',''),'status':'판독 불가','reason':'예약 날짜의 상태를 확인하지 못했습니다.'}
     url=site.get('url','')
     if not url.startswith('https://'): result['reason']='HTTPS 주소가 아닙니다.';return result
-    context=await browser.new_context(locale='ko-KR',timezone_id='Asia/Seoul')
+    context=await browser.new_context(locale='ko-KR',timezone_id='Asia/Seoul', viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True, device_scale_factor=1, user_agent='Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36')
     page=await context.new_page()
     trace=[]
     key=safe_name(site.get('name','site'))+'_'+safe_name(site.get('date','date'))
@@ -26,7 +26,12 @@ async def inspect(browser,site):
 
     try:
         await page.goto(url,wait_until='domcontentloaded',timeout=30000)
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(1800)
+        # Some Kakao entry URLs show a landing page with a yellow 예약하기 button.
+        if await page.get_by_role('button',name=re.compile('예약하기')).count() == 1:
+            log('landing booking button found')
+            await page.get_by_role('button',name=re.compile('예약하기')).click(timeout=10000)
+            await page.wait_for_timeout(1600)
         log('initial URL: '+page.url)
         await snapshot('01_initial')
         # The saved Kakao DOM contains a clickable product button, not a clickable "상세보기" span.
@@ -46,18 +51,40 @@ async def inspect(browser,site):
         await page.wait_for_timeout(2200)
         log('after personal click URL: '+page.url)
         await snapshot('02_personal_detail')
-        # Explicitly verify the target month is displayed. Never interpret missing text as open.
+        # Kakao's client-side transition may display a blank ticket page in headless Chromium.
+        # Retry the known ticket URL as a full document navigation, then reload if necessary.
+        detail_url=page.url
+        if not re.search(r'/detail/ticket/\d+',detail_url):
+            result['reason']='개인 입장권 상세 주소로 이동하지 못했습니다.'
+            return result
+        async def calendar_loaded():
+            try:
+                await page.get_by_text('일정을 선택하세요',exact=False).first.wait_for(state='visible',timeout=8000)
+                return True
+            except Exception:
+                return False
+        loaded=await calendar_loaded()
+        if not loaded:
+            log('calendar missing after SPA transition; hard navigating to ticket URL')
+            await page.goto(detail_url,wait_until='domcontentloaded',timeout=30000)
+            loaded=await calendar_loaded()
+            await snapshot('03_direct_ticket')
+        if not loaded:
+            log('calendar missing after direct navigation; reload once')
+            await page.reload(wait_until='domcontentloaded',timeout=30000)
+            loaded=await calendar_loaded()
+            await snapshot('04_reloaded_ticket')
+        if not loaded:
+            log('calendar unavailable after all attempts; title='+repr(await page.title())+' body='+repr((await page.locator('body').inner_text())[:300]))
+            result['reason']='개인 입장권 상세 주소에 도착했으나 달력이 로딩되지 않았습니다. 진단 이미지 확인 필요.'
+            return result
         target=site.get('date','')
         try:
             d=datetime.date.fromisoformat(target)
         except ValueError:
             result['reason']='감시 날짜 형식 오류 (YYYY-MM-DD)';return result
-        html=await page.content()
         text=await page.locator('body').inner_text(timeout=10000)
-        if '일정을 선택하세요' not in text:
-            result['reason']='개인 상세보기 이후 예약 달력을 찾지 못했습니다.'
-            log('calendar heading not found')
-            return result
+        await snapshot('05_calendar_loaded')
         log('calendar heading found')
         # Navigate only if the displayed month can be unambiguously identified.
         # Do not click guessed next-month buttons: that could silently inspect a wrong month.
@@ -132,8 +159,8 @@ async def main():
     if token and chat:
         import urllib.request,urllib.parse
         for r in results:
-            if r['status']=='확인 필요':
-                msg=f"[예약 확인 필요] {r['name']} {r['date']}\n예약마감 표시 미발견(예약 확정 아님). 직접 확인하세요."
+            if r['status']=='예약 가능':
+                msg=f"[예약 가능] {r['name']} {r['date']}\n예약 가능 회차가 확인되었습니다."
                 data=urllib.parse.urlencode({'chat_id':chat,'text':msg}).encode()
                 try:urllib.request.urlopen(urllib.request.Request('https://api.telegram.org/bot'+token+'/sendMessage',data=data),timeout=10)
                 except Exception as e:print('Telegram failed:',e)
