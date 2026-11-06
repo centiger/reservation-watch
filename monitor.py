@@ -1,4 +1,4 @@
-"""Conservative monitor: never equate missing text with availability unless date cell verified."""
+"""v1.6: conservative monitor and sanitized public API schema diagnostics."""
 import asyncio, datetime, json, os, re, traceback, urllib.parse
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -16,6 +16,7 @@ async def inspect(browser,site):
     page=await context.new_page()
     trace=[]
     network=[]
+    api_shapes=[]
     failures=[]
     console_errors=[]
     interesting=re.compile(r'api|calendar|schedule|ticket|booking|inventory|stock|slot|date|reserve|product|availability',re.I)
@@ -28,6 +29,37 @@ async def inspect(browser,site):
         u=scrub_url(resp.url)
         if req.resource_type in ('xhr','fetch') or interesting.search(urllib.parse.urlsplit(resp.url).path):
             network.append({'event':'response','method':req.method,'type':req.resource_type,'status':resp.status,'url':u})
+    async def inspect_api_response(resp):
+        """Record only structural metadata for public ticket API responses, never bodies."""
+        path=urllib.parse.urlsplit(resp.url).path
+        if resp.status != 200 or not path.startswith('/api/product/public/ticket/'):
+            return
+        try:
+            data=await resp.json()
+            seen=[]
+            def walk(obj, prefix='', depth=0):
+                if len(seen)>=120 or depth>5:return
+                if isinstance(obj,dict):
+                    for k,v in list(obj.items())[:65]:
+                        key=str(k)
+                        kp=(prefix+'.'+key).strip('.')
+                        if isinstance(v,(dict,list)):
+                            seen.append({'path':kp,'type':type(v).__name__,'length':len(v)})
+                            walk(v,kp,depth+1)
+                        else:
+                            # No values are exported: response might contain personal information.
+                            seen.append({'path':kp,'type':type(v).__name__})
+                elif isinstance(obj,list) and obj:
+                    walk(obj[0],prefix+'[0]',depth+1)
+            walk(data)
+            api_shapes.append({'path':path,'status':resp.status,'fields':seen})
+        except Exception as e:
+            api_shapes.append({'path':path,'error_type':type(e).__name__})
+    pending=[]
+    def schedule_api_inspection(resp):
+        if resp.status==200 and '/api/product/public/ticket/' in resp.url:
+            pending.append(asyncio.create_task(inspect_api_response(resp)))
+    page.on('response',schedule_api_inspection)
     def request_failed(req):
         failures.append({'method':req.method,'type':req.resource_type,'url':scrub_url(req.url),'failure':str(req.failure)[:180]})
     def page_error(err):
@@ -177,8 +209,10 @@ async def inspect(browser,site):
         result['final_url']=page.url
         result['diagnostics']=key
         (DIAG/(key+'_trace.json')).write_text(json.dumps(trace,ensure_ascii=False,indent=2),encoding='utf-8')
-        # Diagnostics: request paths/statuses only. Never record request/response bodies, cookies, or URL query strings.
-        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:]}
+        # Diagnostics: request paths/statuses and JSON key names/types only; never bodies, cookies or query strings.
+        if pending:
+            await asyncio.gather(*pending,return_exceptions=True)
+        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-30:]}
         (DIAG/(key+'_network.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         log(f'network diagnostic: {len(network)} responses, {len(failures)} failed requests, {len(console_errors)} JS/console errors')
         try:
