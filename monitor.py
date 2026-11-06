@@ -12,7 +12,7 @@ async def inspect(browser,site):
     result={'name':site.get('name',''),'date':site.get('date',''),'status':'판독 불가','reason':'예약 날짜의 상태를 확인하지 못했습니다.'}
     url=site.get('url','')
     if not url.startswith('https://'): result['reason']='HTTPS 주소가 아닙니다.';return result
-    context=await browser.new_context(locale='ko-KR',timezone_id='Asia/Seoul', viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True, device_scale_factor=1, user_agent='Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36')
+    context=await browser.new_context(locale='ko-KR',timezone_id='Asia/Seoul', viewport={'width': 1280, 'height': 900}, is_mobile=False, has_touch=False, device_scale_factor=1)
     page=await context.new_page()
     trace=[]
     key=safe_name(site.get('name','site'))+'_'+safe_name(site.get('date','date'))
@@ -26,12 +26,25 @@ async def inspect(browser,site):
 
     try:
         await page.goto(url,wait_until='domcontentloaded',timeout=30000)
-        await page.wait_for_timeout(1800)
+        await page.wait_for_timeout(2500)
+        if '/install.html' in page.url:
+            log('Kakao app bridge encountered; retrying original URL as desktop')
+            await page.goto(url,wait_until='domcontentloaded',timeout=30000)
+            await page.wait_for_timeout(2500)
+        if '/install.html' in page.url:
+            result['reason']='카카오톡 앱 실행 안내 페이지로 전환되어 예약 화면 접근 불가'
+            await snapshot('00_app_bridge')
+            return result
         # Some Kakao entry URLs show a landing page with a yellow 예약하기 button.
-        if await page.get_by_role('button',name=re.compile('예약하기')).count() == 1:
+        booking_button=page.get_by_role('button',name=re.compile('예약하기'))
+        if await booking_button.count() == 1:
             log('landing booking button found')
-            await page.get_by_role('button',name=re.compile('예약하기')).click(timeout=10000)
-            await page.wait_for_timeout(1600)
+            await booking_button.click(timeout=10000)
+            await page.wait_for_timeout(1800)
+        if '/install.html' in page.url:
+            result['reason']='예약하기 클릭 후 카카오톡 앱 실행 안내로 전환됨'
+            await snapshot('00_app_bridge')
+            return result
         log('initial URL: '+page.url)
         await snapshot('01_initial')
         # The saved Kakao DOM contains a clickable product button, not a clickable "상세보기" span.
