@@ -1,4 +1,4 @@
-"""v1.9: recognize access restrictions, inspect public schedule schemas safely; never infer availability."""
+"""v2.0: preserve SPA session; diagnose blocked calendar requests without hard navigation."""
 import asyncio, datetime, json, os, re, traceback, urllib.parse
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -25,6 +25,7 @@ async def inspect(browser,site):
     next_data_shapes=[]
     public_schedule_schema=[]
     access_restricted=False
+    route_diagnostics=[]
     async def runtime_probe(stage):
         # Only booleans, DOM counts and public schema keys; never cookies or user data.
         try:
@@ -187,47 +188,36 @@ async def inspect(browser,site):
         await snapshot('02_personal_detail')
         await runtime_probe('after_personal_click')
         await public_schema_probe('after_personal_click')
-        # Kakao's client-side transition may display a blank ticket page in headless Chromium.
-        # Retry the known ticket URL as a full document navigation, then reload if necessary.
+        # Preserve the original session and SPA transition. Hard navigation to
+        # the detail URL returned isBot=true in previous diagnostics.
         detail_url=page.url
         if not re.search(r'/detail/ticket/\d+',detail_url):
             result['reason']='개인 입장권 상세 주소로 이동하지 못했습니다.'
             return result
         async def calendar_loaded():
             try:
-                await page.get_by_text('일정을 선택하세요',exact=False).first.wait_for(state='visible',timeout=8000)
+                await page.get_by_text('일정을 선택하세요',exact=False).first.wait_for(state='visible',timeout=1000)
                 return True
             except Exception:
                 return False
-        loaded=await calendar_loaded()
-        if not loaded:
-            log('calendar missing after SPA transition; hard navigating to ticket URL')
-            await page.goto(detail_url,wait_until='domcontentloaded',timeout=30000)
-            await page.wait_for_timeout(3000)
+        loaded=False
+        for elapsed in (0, 3, 8, 15, 25):
+            if elapsed:
+                await page.wait_for_timeout((elapsed-(0 if elapsed==3 else {8:3,15:8,25:15}[elapsed]))*1000)
             loaded=await calendar_loaded()
-            await snapshot('03_direct_ticket')
-            await runtime_probe('direct_ticket')
-            if await public_schema_probe('direct_ticket'):
-                access_restricted=True
-                result['reason']='카카오가 자동화 접속을 봇으로 분류(isBot=true)하여 달력 확인이 제한되었습니다.'
-                result['status']='접근 제한'
-                log('isBot=true; stop retrying rather than misreporting availability')
-                return result
+            route_diagnostics.append({'seconds':elapsed,'calendar_visible':loaded,'url':scrub_url(page.url),
+                                      'visible_body_length':len(await page.locator('body').inner_text(timeout=5000))})
+            if loaded: break
         if not loaded:
-            log('calendar missing after direct navigation; reload once')
-            await page.reload(wait_until='domcontentloaded',timeout=30000)
-            await page.wait_for_timeout(3000)
-            loaded=await calendar_loaded()
-            await snapshot('04_reloaded_ticket')
-            await runtime_probe('reloaded_ticket')
-            if await public_schema_probe('reloaded_ticket'):
-                access_restricted=True
-                result['status']='접근 제한'
-                result['reason']='카카오가 자동화 접속을 봇으로 분류(isBot=true)하여 달력 확인이 제한되었습니다.'
-                return result
+            await snapshot('03_spa_waited')
+            await runtime_probe('spa_waited')
+            await public_schema_probe('spa_waited')
+            # A blocked resource can be relevant even when no JS exception is emitted.
+            blocked=[x for x in network if x.get('status') in (401,403,429)]
+            route_diagnostics.append({'blocked_http_responses':blocked[-30:]})
         if not loaded:
             log('calendar unavailable after all attempts; title='+repr(await page.title())+' body='+repr((await page.locator('body').inner_text())[:300]))
-            result['reason']='개인 입장권 상세 주소에 도착했으나 달력이 로딩되지 않았습니다. 네트워크/JS 진단 파일 확인 필요.'
+            result['reason']='원래 세션에서 개인 상세 페이지를 25초 이상 기다렸으나 달력이 표시되지 않았습니다. 네트워크 진단 확인 필요.'
             return result
         target=site.get('date','')
         try:
@@ -296,7 +286,7 @@ async def inspect(browser,site):
         # Diagnostics: request paths/statuses and JSON key names/types only; never bodies, cookies or query strings.
         if pending:
             await asyncio.gather(*pending,return_exceptions=True)
-        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-50:],'candidate_api_paths':sorted(discovered_paths)[:300],'script_discoveries':script_discoveries[:80], 'runtime_snapshots':runtime_snapshots,'public_schedule_schema':public_schedule_schema,'access_restricted':access_restricted}
+        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-50:],'candidate_api_paths':sorted(discovered_paths)[:300],'script_discoveries':script_discoveries[:80], 'runtime_snapshots':runtime_snapshots,'public_schedule_schema':public_schedule_schema,'access_restricted':access_restricted,'spa_route_diagnostics':route_diagnostics}
         (DIAG/(key+'_network.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         log(f'network diagnostic: {len(network)} responses, {len(failures)} failed requests, {len(console_errors)} JS/console errors')
         await context.close()
