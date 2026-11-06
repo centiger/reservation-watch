@@ -29,34 +29,80 @@ async def inspect(browser,site):
         await page.wait_for_timeout(2500)
         log('initial URL: '+page.url)
         await snapshot('01_initial')
-        # Navigation attempts are best-effort; never infer bookability from their success.
-        for label in ['예약하기','상세보기','개인']:
-            try:
-                loc=page.get_by_text(label,exact=False)
-                if await loc.count()==1 and await loc.first.is_visible():
-                    await loc.first.click(timeout=3500)
-                    await page.wait_for_timeout(1300)
-                    log('clicked '+label+' URL: '+page.url)
-                    await snapshot('after_'+safe_name(label))
-            except Exception as e:log('navigation '+label+' skipped: '+str(e)[:120])
-        target=site.get('date','')
-        try: day=int(target[-2:])
-        except: result['reason']='날짜 형식 오류';return result
-        # A DOM date-cell must carry an unambiguous ISO date or full YYYY.MM.DD identifier.
-        variants=[target,target.replace('-','.')]
-        matches=[]
-        for val in variants:
-            matches+=await page.locator('[data-date="'+val+'"], [aria-label*="'+val+'"], [title*="'+val+'"]').all()
-        matches=[m for m in matches if await m.is_visible()]
-        log('date locator matches: '+str(len(matches)))
-        await snapshot('02_final')
-        if len(matches)!=1:
-            result['reason']='대상 날짜 셀을 고유하게 식별하지 못했습니다. 카카오 달력 전용 판독기 검증 필요.'
+        # The saved Kakao DOM contains a clickable product button, not a clickable "상세보기" span.
+        # Select the personal product button by its own title; never click the group ticket.
+        product=page.locator('button.product_ticket').filter(has=page.locator('.tit_product',has_text=re.compile(r'입장권\s*\(개인\)')))
+        count=await product.count()
+        log('personal ticket buttons: '+str(count))
+        if count!=1:
+            result['reason']='개인 입장권 버튼을 고유하게 찾지 못했습니다.'
+            await snapshot('02_no_personal_ticket')
             return result
-        cell=matches[0]
-        txt=await cell.inner_text(timeout=3000)
-        if '예약마감' in txt:result.update(status='예약마감',reason='지정 날짜 셀에서 예약마감 확인')
-        else:result.update(status='확인 필요',reason='지정 날짜 셀에서 예약마감 문구 미발견. 실제 예약 가능 여부는 미확정')
+        try:
+            await product.click(timeout=12000)
+            await page.wait_for_load_state('domcontentloaded',timeout=10000)
+        except Exception as e:
+            log('click/load note: '+str(e)[:180])
+        await page.wait_for_timeout(2200)
+        log('after personal click URL: '+page.url)
+        await snapshot('02_personal_detail')
+        # Explicitly verify the target month is displayed. Never interpret missing text as open.
+        target=site.get('date','')
+        try:
+            d=datetime.date.fromisoformat(target)
+        except ValueError:
+            result['reason']='감시 날짜 형식 오류 (YYYY-MM-DD)';return result
+        html=await page.content()
+        text=await page.locator('body').inner_text(timeout=10000)
+        if '일정을 선택하세요' not in text:
+            result['reason']='개인 상세보기 이후 예약 달력을 찾지 못했습니다.'
+            log('calendar heading not found')
+            return result
+        log('calendar heading found')
+        # Navigate only if the displayed month can be unambiguously identified.
+        # Do not click guessed next-month buttons: that could silently inspect a wrong month.
+        month_re=re.compile(rf'{d.year}\s*년\s*0?{d.month}\s*월')
+        if not month_re.search(text):
+            result['reason']=f'{d.year}년 {d.month}월 달력이 표시되지 않았습니다. 다른 월 자동 이동은 아직 미지원입니다.'
+            log('target month not visible')
+            return result
+        log('target month confirmed')
+        # Save DOM structures containing the target date for selector development.
+        # A date is accepted only if its own container can be identified uniquely.
+        candidates=await page.evaluate("""({iso, day}) => {
+          const nodes=[...document.querySelectorAll('button,td,[role=gridcell],[data-date],[aria-label],li')];
+          return nodes.filter(el => {
+            const attrs=[el.getAttribute('data-date'),el.getAttribute('aria-label'),el.getAttribute('title'),el.getAttribute('datetime')].filter(Boolean).join(' ');
+            const own=(el.innerText||'').trim();
+            return attrs.includes(iso) || (own===String(day) && el.closest('[class*=calendar], [class*=date], [class*=day], table, [role=grid]'));
+          }).slice(0,40).map(el=>({tag:el.tagName,outer:el.outerHTML.slice(0,1800),parent:el.parentElement?.outerHTML.slice(0,2600)}));
+        }""",{'iso':target,'day':d.day})
+        (DIAG/(key+'_date_candidates.json')).write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+        log('candidate date nodes: '+str(len(candidates)))
+        # Strict ISO-identified date cell. We intentionally do not claim availability
+        # when only a bare day number is found, since adjacent-month days can repeat.
+        selectors=[f'[data-date="{target}"]',f'[datetime="{target}"]',f'[aria-label*="{target}"]',f'[title*="{target}"]',f'[data-date="{target.replace("-", ".")}"]']
+        unique=[]
+        for selector in selectors:
+            for loc in await page.locator(selector).all():
+                if await loc.is_visible():
+                    unique.append(loc)
+        if len(unique)!=1:
+            result['reason']='달력 진입 성공. 다만 날짜 셀의 고유 식별자가 확인되지 않아 판독을 보류했습니다.'
+            await snapshot('03_calendar_date_unresolved')
+            return result
+        cell=unique[0]
+        cell_text=await cell.inner_text(timeout=3000)
+        cell_class=(await cell.get_attribute('class')) or ''
+        disabled=(await cell.get_attribute('disabled')) is not None or (await cell.get_attribute('aria-disabled'))=='true'
+        log('date cell text: '+repr(cell_text[:160]))
+        if '예약마감' in cell_text:
+            result.update(status='예약마감',reason='지정 날짜 셀에 예약마감 표시 확인')
+        elif disabled or any(x in cell_class.lower() for x in ('disabled','soldout','inactive')):
+            result.update(status='확인 필요',reason='예약마감 문구는 없지만 날짜가 비활성 상태입니다. 예약 가능으로 판단하지 않습니다.')
+        else:
+            result.update(status='확인 필요',reason='지정 날짜 셀에 예약마감 문구 없음. 실제 회차 선택 가능 여부는 확인 필요')
+        await snapshot('03_calendar_checked')
     except Exception as e:
         result['reason']='접속/탐색 오류: '+str(e)[:120]
         log('ERROR: '+repr(e))
