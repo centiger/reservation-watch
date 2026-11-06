@@ -1,4 +1,4 @@
-"""v1.6: conservative monitor and sanitized public API schema diagnostics."""
+"""v1.7: discover calendar/schedule APIs while preserving conservative verdicts."""
 import asyncio, datetime, json, os, re, traceback, urllib.parse
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -17,6 +17,8 @@ async def inspect(browser,site):
     trace=[]
     network=[]
     api_shapes=[]
+    script_discoveries=[]
+    discovered_paths=set()
     failures=[]
     console_errors=[]
     interesting=re.compile(r'api|calendar|schedule|ticket|booking|inventory|stock|slot|date|reserve|product|availability',re.I)
@@ -32,7 +34,7 @@ async def inspect(browser,site):
     async def inspect_api_response(resp):
         """Record only structural metadata for public ticket API responses, never bodies."""
         path=urllib.parse.urlsplit(resp.url).path
-        if resp.status != 200 or not path.startswith('/api/product/public/ticket/'):
+        if resp.status != 200 or not (path.startswith('/api/product/public/ticket/') or (resp.request.resource_type in ('xhr','fetch') and interesting.search(path))):
             return
         try:
             data=await resp.json()
@@ -57,7 +59,7 @@ async def inspect(browser,site):
             api_shapes.append({'path':path,'error_type':type(e).__name__})
     pending=[]
     def schedule_api_inspection(resp):
-        if resp.status==200 and '/api/product/public/ticket/' in resp.url:
+        if resp.status==200 and (('/api/product/public/ticket/' in resp.url) or (resp.request.resource_type in ('xhr','fetch') and interesting.search(urllib.parse.urlsplit(resp.url).path))):
             pending.append(asyncio.create_task(inspect_api_response(resp)))
     page.on('response',schedule_api_inspection)
     def request_failed(req):
@@ -206,19 +208,36 @@ async def inspect(browser,site):
         log('ERROR: '+repr(e))
         await snapshot('error')
     finally:
+        # Discover literal API paths in already-loaded public JS bundles. No page data,
+        # cookies, tokens, or arbitrary JS source is written to diagnostics.
+        try:
+            scripts=await page.locator('script[src]').evaluate_all('(els) => els.map(e => e.src).filter(Boolean)')
+            script_urls=[u for u in dict.fromkeys(scripts) if urllib.parse.urlsplit(u).netloc in ('t1.kakaocdn.net','booking.kakao.com')][:100]
+            async def scan_script(u):
+                try:
+                    resp=await context.request.get(u,timeout=9000)
+                    if resp.status!=200:return
+                    body=await resp.text()
+                    if len(body)>4000000:return
+                    # Find only path literals: exclude query strings and variable values.
+                    found=set(re.findall(r'/api/(?:[A-Za-z0-9_./-]{3,180})',body))
+                    found={v.rstrip('\\') for v in found if interesting.search(v)}
+                    for v in found:
+                        if '?' not in v and '#' not in v:discovered_paths.add(v)
+                    if found:script_discoveries.append({'script':scrub_url(u),'api_path_count':len(found)})
+                except Exception:pass
+            await asyncio.gather(*(scan_script(u) for u in script_urls[-65:]))
+        except Exception as e:
+            trace.append('JS path scan: '+type(e).__name__)
         result['final_url']=page.url
         result['diagnostics']=key
         (DIAG/(key+'_trace.json')).write_text(json.dumps(trace,ensure_ascii=False,indent=2),encoding='utf-8')
         # Diagnostics: request paths/statuses and JSON key names/types only; never bodies, cookies or query strings.
         if pending:
             await asyncio.gather(*pending,return_exceptions=True)
-        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-30:]}
+        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-50:],'candidate_api_paths':sorted(discovered_paths)[:300],'script_discoveries':script_discoveries[:80]}
         (DIAG/(key+'_network.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         log(f'network diagnostic: {len(network)} responses, {len(failures)} failed requests, {len(console_errors)} JS/console errors')
-        try:
-            html=await page.content()
-            (DIAG/(key+'_dom.html')).write_text(html[:1500000],encoding='utf-8')
-        except Exception:pass
         await context.close()
     return result
 async def main():
@@ -232,7 +251,7 @@ async def main():
     now=datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).isoformat(timespec='seconds')
     (ROOT/'data').mkdir(exist_ok=True)
     (ROOT/'data/status.json').write_text(json.dumps({'checked_at':now,'results':results},ensure_ascii=False,indent=2),encoding='utf-8')
-    # Optional Telegram alert only for candidates; not confirmed availability.
+    # Telegram is deliberately gated on independently confirmed available slots.
     token=os.getenv('TELEGRAM_BOT_TOKEN');chat=os.getenv('TELEGRAM_CHAT_ID')
     if token and chat:
         import urllib.request,urllib.parse
