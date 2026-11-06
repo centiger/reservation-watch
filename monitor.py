@@ -1,17 +1,34 @@
 """Conservative monitor: never equate missing text with availability unless date cell verified."""
-import asyncio, datetime, json, os, re
+import asyncio, datetime, json, os, re, traceback
 from pathlib import Path
 from playwright.async_api import async_playwright
 ROOT=Path(__file__).parent
+DIAG=ROOT/'diagnostics'
+DIAG.mkdir(exist_ok=True)
+def safe_name(s):
+    return re.sub(r'[^a-zA-Z0-9_-]', '_', s)[:45] or 'site'
+
 async def inspect(browser,site):
     result={'name':site.get('name',''),'date':site.get('date',''),'status':'판독 불가','reason':'예약 날짜의 상태를 확인하지 못했습니다.'}
     url=site.get('url','')
     if not url.startswith('https://'): result['reason']='HTTPS 주소가 아닙니다.';return result
     context=await browser.new_context(locale='ko-KR',timezone_id='Asia/Seoul')
     page=await context.new_page()
+    trace=[]
+    key=safe_name(site.get('name','site'))+'_'+safe_name(site.get('date','date'))
+    async def snapshot(stage):
+        try:
+            await page.screenshot(path=str(DIAG/(key+'_'+stage+'.png')),full_page=True,timeout=12000)
+        except Exception as e:trace.append('screenshot error: '+str(e)[:100])
+    def log(message):
+        trace.append(message)
+        print('['+key+'] '+message,flush=True)
+
     try:
         await page.goto(url,wait_until='domcontentloaded',timeout=30000)
         await page.wait_for_timeout(2500)
+        log('initial URL: '+page.url)
+        await snapshot('01_initial')
         # Navigation attempts are best-effort; never infer bookability from their success.
         for label in ['예약하기','상세보기','개인']:
             try:
@@ -19,7 +36,9 @@ async def inspect(browser,site):
                 if await loc.count()==1 and await loc.first.is_visible():
                     await loc.first.click(timeout=3500)
                     await page.wait_for_timeout(1300)
-            except Exception: pass
+                    log('clicked '+label+' URL: '+page.url)
+                    await snapshot('after_'+safe_name(label))
+            except Exception as e:log('navigation '+label+' skipped: '+str(e)[:120])
         target=site.get('date','')
         try: day=int(target[-2:])
         except: result['reason']='날짜 형식 오류';return result
@@ -29,6 +48,8 @@ async def inspect(browser,site):
         for val in variants:
             matches+=await page.locator('[data-date="'+val+'"], [aria-label*="'+val+'"], [title*="'+val+'"]').all()
         matches=[m for m in matches if await m.is_visible()]
+        log('date locator matches: '+str(len(matches)))
+        await snapshot('02_final')
         if len(matches)!=1:
             result['reason']='대상 날짜 셀을 고유하게 식별하지 못했습니다. 카카오 달력 전용 판독기 검증 필요.'
             return result
@@ -36,8 +57,19 @@ async def inspect(browser,site):
         txt=await cell.inner_text(timeout=3000)
         if '예약마감' in txt:result.update(status='예약마감',reason='지정 날짜 셀에서 예약마감 확인')
         else:result.update(status='확인 필요',reason='지정 날짜 셀에서 예약마감 문구 미발견. 실제 예약 가능 여부는 미확정')
-    except Exception as e:result['reason']='접속/탐색 오류: '+str(e)[:120]
-    finally:await context.close()
+    except Exception as e:
+        result['reason']='접속/탐색 오류: '+str(e)[:120]
+        log('ERROR: '+repr(e))
+        await snapshot('error')
+    finally:
+        result['final_url']=page.url
+        result['diagnostics']=key
+        (DIAG/(key+'_trace.json')).write_text(json.dumps(trace,ensure_ascii=False,indent=2),encoding='utf-8')
+        try:
+            html=await page.content()
+            (DIAG/(key+'_dom.html')).write_text(html[:1500000],encoding='utf-8')
+        except Exception:pass
+        await context.close()
     return result
 async def main():
     sites=json.loads((ROOT/'sites.json').read_text(encoding='utf-8'))[:5]
