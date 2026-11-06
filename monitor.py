@@ -1,5 +1,5 @@
 """Conservative monitor: never equate missing text with availability unless date cell verified."""
-import asyncio, datetime, json, os, re, traceback
+import asyncio, datetime, json, os, re, traceback, urllib.parse
 from pathlib import Path
 from playwright.async_api import async_playwright
 ROOT=Path(__file__).parent
@@ -15,6 +15,30 @@ async def inspect(browser,site):
     context=await browser.new_context(locale='ko-KR',timezone_id='Asia/Seoul', viewport={'width': 1280, 'height': 900}, is_mobile=False, has_touch=False, device_scale_factor=1)
     page=await context.new_page()
     trace=[]
+    network=[]
+    failures=[]
+    console_errors=[]
+    interesting=re.compile(r'api|calendar|schedule|ticket|booking|inventory|stock|slot|date|reserve|product|availability',re.I)
+    def scrub_url(url):
+        # Do not export authentication tokens, cookies, query parameters or personal data.
+        parsed=urllib.parse.urlsplit(url)
+        return parsed.scheme+'://'+parsed.netloc+parsed.path
+    def response_hook(resp):
+        req=resp.request
+        u=scrub_url(resp.url)
+        if req.resource_type in ('xhr','fetch') or interesting.search(urllib.parse.urlsplit(resp.url).path):
+            network.append({'event':'response','method':req.method,'type':req.resource_type,'status':resp.status,'url':u})
+    def request_failed(req):
+        failures.append({'method':req.method,'type':req.resource_type,'url':scrub_url(req.url),'failure':str(req.failure)[:180]})
+    def page_error(err):
+        console_errors.append({'kind':'pageerror','message':str(err)[:350]})
+    def console_hook(msg):
+        if msg.type=='error':
+            console_errors.append({'kind':'console','message':msg.text[:350]})
+    page.on('response',response_hook)
+    page.on('requestfailed',request_failed)
+    page.on('pageerror',page_error)
+    page.on('console',console_hook)
     key=safe_name(site.get('name','site'))+'_'+safe_name(site.get('date','date'))
     async def snapshot(stage):
         try:
@@ -61,7 +85,7 @@ async def inspect(browser,site):
             await page.wait_for_load_state('domcontentloaded',timeout=10000)
         except Exception as e:
             log('click/load note: '+str(e)[:180])
-        await page.wait_for_timeout(2200)
+        await page.wait_for_timeout(5000)
         log('after personal click URL: '+page.url)
         await snapshot('02_personal_detail')
         # Kakao's client-side transition may display a blank ticket page in headless Chromium.
@@ -80,16 +104,18 @@ async def inspect(browser,site):
         if not loaded:
             log('calendar missing after SPA transition; hard navigating to ticket URL')
             await page.goto(detail_url,wait_until='domcontentloaded',timeout=30000)
+            await page.wait_for_timeout(3000)
             loaded=await calendar_loaded()
             await snapshot('03_direct_ticket')
         if not loaded:
             log('calendar missing after direct navigation; reload once')
             await page.reload(wait_until='domcontentloaded',timeout=30000)
+            await page.wait_for_timeout(3000)
             loaded=await calendar_loaded()
             await snapshot('04_reloaded_ticket')
         if not loaded:
             log('calendar unavailable after all attempts; title='+repr(await page.title())+' body='+repr((await page.locator('body').inner_text())[:300]))
-            result['reason']='개인 입장권 상세 주소에 도착했으나 달력이 로딩되지 않았습니다. 진단 이미지 확인 필요.'
+            result['reason']='개인 입장권 상세 주소에 도착했으나 달력이 로딩되지 않았습니다. 네트워크/JS 진단 파일 확인 필요.'
             return result
         target=site.get('date','')
         try:
@@ -151,6 +177,10 @@ async def inspect(browser,site):
         result['final_url']=page.url
         result['diagnostics']=key
         (DIAG/(key+'_trace.json')).write_text(json.dumps(trace,ensure_ascii=False,indent=2),encoding='utf-8')
+        # Diagnostics: request paths/statuses only. Never record request/response bodies, cookies, or URL query strings.
+        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:]}
+        (DIAG/(key+'_network.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+        log(f'network diagnostic: {len(network)} responses, {len(failures)} failed requests, {len(console_errors)} JS/console errors')
         try:
             html=await page.content()
             (DIAG/(key+'_dom.html')).write_text(html[:1500000],encoding='utf-8')
@@ -166,6 +196,7 @@ async def main():
             if s.get('enabled'):results.append(await inspect(browser,s))
         await browser.close()
     now=datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).isoformat(timespec='seconds')
+    (ROOT/'data').mkdir(exist_ok=True)
     (ROOT/'data/status.json').write_text(json.dumps({'checked_at':now,'results':results},ensure_ascii=False,indent=2),encoding='utf-8')
     # Optional Telegram alert only for candidates; not confirmed availability.
     token=os.getenv('TELEGRAM_BOT_TOKEN');chat=os.getenv('TELEGRAM_CHAT_ID')
