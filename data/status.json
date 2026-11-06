@@ -1,12 +1,12 @@
 {
-  "checked_at": "2026-11-06T13:46:54+09:00",
+  "checked_at": "2026-11-06T13:55:40+09:00",
   "results": [
     {
       "name": "재인폭포파크골프장",
       "date": "2026-11-14",
       "status": "판독 불가",
-      "reason": "개인 상세보기 이후 예약 달력을 찾지 못했습니다.",
-      "final_url": "https://booking.kakao.com/detail/ticket/231582",
+      "reason": "개인 입장권 버튼을 고유하게 찾지 못했습니다.",
+      "final_url": "https://booking.kakao.com/install.html?continue=https%3A%2F%2Fbooking.kakao.com%2Fdetail%2FticketStore%2F72866%3F",
       "diagnostics": "__________2026-11-14"
     }
   ]
