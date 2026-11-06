@@ -1,4 +1,4 @@
-"""v1.8: diagnose ticket-page hydration and calendar gating; no speculative availability."""
+"""v1.9: recognize access restrictions, inspect public schedule schemas safely; never infer availability."""
 import asyncio, datetime, json, os, re, traceback, urllib.parse
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -23,6 +23,8 @@ async def inspect(browser,site):
     console_errors=[]
     runtime_snapshots=[]
     next_data_shapes=[]
+    public_schedule_schema=[]
+    access_restricted=False
     async def runtime_probe(stage):
         # Only booleans, DOM counts and public schema keys; never cookies or user data.
         try:
@@ -54,6 +56,33 @@ async def inspect(browser,site):
             runtime_snapshots.append(item)
         except Exception as e:
             runtime_snapshots.append({'stage':stage,'error_type':type(e).__name__})
+    async def public_schema_probe(stage):
+        """Inspect only public state key paths/types, never store values or credentials."""
+        try:
+            shape=await page.evaluate("""(stage) => {
+              const nd=document.querySelector('#__NEXT_DATA__');
+              if(!nd)return {stage,available:false};
+              let o;try{o=JSON.parse(nd.textContent)}catch(e){return {stage,parseError:true}}
+              const pp=o?.props?.pageProps||{};
+              const hits=[];let visited=0;
+              const terms=/calendar|schedule|remain|capacity|stock|slot|inventory|date|available|reservation|booking|ticket/i;
+              function walk(v,path,depth){if(depth>7||visited++>1800||hits.length>140||!v||typeof v!=='object')return;
+                if(Array.isArray(v)){if(v.length)walk(v[0],path+'[0]',depth+1);return}
+                for(const [k,x] of Object.entries(v).slice(0,80)){
+                  const at=path+'.'+k;
+                  if(terms.test(k))hits.push({path:at,type:Array.isArray(x)?'array':typeof x, length:Array.isArray(x)?x.length:undefined});
+                  if(x&&typeof x==='object')walk(x,at,depth+1);
+                }
+              }
+              walk(pp,'pageProps',0);
+              return {stage,available:true,isBot:pp.isBot===true,matchedKeys:hits};
+            }""",stage)
+            public_schedule_schema.append(shape)
+            return bool(shape.get('isBot'))
+        except Exception as e:
+            public_schedule_schema.append({'stage':stage,'error_type':type(e).__name__})
+            return False
+
     interesting=re.compile(r'api|calendar|schedule|ticket|booking|inventory|stock|slot|date|reserve|product|availability',re.I)
     def scrub_url(url):
         # Do not export authentication tokens, cookies, query parameters or personal data.
@@ -157,6 +186,7 @@ async def inspect(browser,site):
         log('after personal click URL: '+page.url)
         await snapshot('02_personal_detail')
         await runtime_probe('after_personal_click')
+        await public_schema_probe('after_personal_click')
         # Kakao's client-side transition may display a blank ticket page in headless Chromium.
         # Retry the known ticket URL as a full document navigation, then reload if necessary.
         detail_url=page.url
@@ -177,6 +207,12 @@ async def inspect(browser,site):
             loaded=await calendar_loaded()
             await snapshot('03_direct_ticket')
             await runtime_probe('direct_ticket')
+            if await public_schema_probe('direct_ticket'):
+                access_restricted=True
+                result['reason']='카카오가 자동화 접속을 봇으로 분류(isBot=true)하여 달력 확인이 제한되었습니다.'
+                result['status']='접근 제한'
+                log('isBot=true; stop retrying rather than misreporting availability')
+                return result
         if not loaded:
             log('calendar missing after direct navigation; reload once')
             await page.reload(wait_until='domcontentloaded',timeout=30000)
@@ -184,6 +220,11 @@ async def inspect(browser,site):
             loaded=await calendar_loaded()
             await snapshot('04_reloaded_ticket')
             await runtime_probe('reloaded_ticket')
+            if await public_schema_probe('reloaded_ticket'):
+                access_restricted=True
+                result['status']='접근 제한'
+                result['reason']='카카오가 자동화 접속을 봇으로 분류(isBot=true)하여 달력 확인이 제한되었습니다.'
+                return result
         if not loaded:
             log('calendar unavailable after all attempts; title='+repr(await page.title())+' body='+repr((await page.locator('body').inner_text())[:300]))
             result['reason']='개인 입장권 상세 주소에 도착했으나 달력이 로딩되지 않았습니다. 네트워크/JS 진단 파일 확인 필요.'
@@ -196,6 +237,7 @@ async def inspect(browser,site):
         text=await page.locator('body').inner_text(timeout=10000)
         await snapshot('05_calendar_loaded')
         await runtime_probe('calendar_loaded')
+        await public_schema_probe('calendar_loaded')
         log('calendar heading found')
         # Navigate only if the displayed month can be unambiguously identified.
         # Do not click guessed next-month buttons: that could silently inspect a wrong month.
@@ -254,7 +296,7 @@ async def inspect(browser,site):
         # Diagnostics: request paths/statuses and JSON key names/types only; never bodies, cookies or query strings.
         if pending:
             await asyncio.gather(*pending,return_exceptions=True)
-        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-50:],'candidate_api_paths':sorted(discovered_paths)[:300],'script_discoveries':script_discoveries[:80], 'runtime_snapshots':runtime_snapshots}
+        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-50:],'candidate_api_paths':sorted(discovered_paths)[:300],'script_discoveries':script_discoveries[:80], 'runtime_snapshots':runtime_snapshots,'public_schedule_schema':public_schedule_schema,'access_restricted':access_restricted}
         (DIAG/(key+'_network.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         log(f'network diagnostic: {len(network)} responses, {len(failures)} failed requests, {len(console_errors)} JS/console errors')
         await context.close()
@@ -275,7 +317,7 @@ async def main():
     if token and chat:
         import urllib.request,urllib.parse
         for r in results:
-            if r['status']=='예약 가능':
+            if r['status']=='예약 가능' and datetime.date.fromisoformat(r['date']) >= datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).date():
                 msg=f"[예약 가능] {r['name']} {r['date']}\n예약 가능 회차가 확인되었습니다."
                 data=urllib.parse.urlencode({'chat_id':chat,'text':msg}).encode()
                 try:urllib.request.urlopen(urllib.request.Request('https://api.telegram.org/bot'+token+'/sendMessage',data=data),timeout=10)
