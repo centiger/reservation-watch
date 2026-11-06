@@ -1,4 +1,4 @@
-"""v1.7: discover calendar/schedule APIs while preserving conservative verdicts."""
+"""v1.8: diagnose ticket-page hydration and calendar gating; no speculative availability."""
 import asyncio, datetime, json, os, re, traceback, urllib.parse
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -21,6 +21,39 @@ async def inspect(browser,site):
     discovered_paths=set()
     failures=[]
     console_errors=[]
+    runtime_snapshots=[]
+    next_data_shapes=[]
+    async def runtime_probe(stage):
+        # Only booleans, DOM counts and public schema keys; never cookies or user data.
+        try:
+            item=await page.evaluate("""(stage) => {
+              const root=document.querySelector('#__next');
+              const nd=document.querySelector('#__NEXT_DATA__');
+              let parsed=null, props=null, pageProps=null;
+              try {parsed=nd ? JSON.parse(nd.textContent) : null; props=parsed?.props; pageProps=props?.pageProps;}catch(e){}
+              const botKeys=[];
+              function scan(o,p,depth){if(!o||typeof o!=='object'||depth>5||botKeys.length>30)return;
+                for(const k of Object.keys(o).slice(0,100)){
+                  const path=p?`${p}.${k}`:k;
+                  if(/bot|crawler|calendar|schedule|login|auth|error|soldout/i.test(k)){
+                    const v=o[k];botKeys.push({path,type:typeof v,boolean:typeof v==='boolean'?v:undefined});
+                  }
+                  if(o[k]&&typeof o[k]==='object'&&!Array.isArray(o[k]))scan(o[k],path,depth+1);
+                }
+              }
+              scan(pageProps,'pageProps',0);
+              return {stage,pathname:location.pathname,readyState:document.readyState,
+                nextRootPresent:!!root,nextRootChildren:root?.children.length||0,
+                nextDataPresent:!!nd,nextDataPage:parsed?.page||null,
+                nextDataBuildId:parsed?.buildId||null,
+                pagePropKeys:pageProps?Object.keys(pageProps).slice(0,80):[],
+                botRelatedKeys:botKeys,bodyTextLength:document.body?.innerText?.length||0,
+                calendarHeadingCount:[...document.querySelectorAll('*')].filter(e=>e.children.length===0 && (e.textContent||'').includes('일정을 선택하세요')).length,
+                appContainerTags:[...document.body.children].slice(0,10).map(e=>({tag:e.tagName,id:e.id||'',className:String(e.className||'').slice(0,100)}))};
+            }""",stage)
+            runtime_snapshots.append(item)
+        except Exception as e:
+            runtime_snapshots.append({'stage':stage,'error_type':type(e).__name__})
     interesting=re.compile(r'api|calendar|schedule|ticket|booking|inventory|stock|slot|date|reserve|product|availability',re.I)
     def scrub_url(url):
         # Do not export authentication tokens, cookies, query parameters or personal data.
@@ -65,10 +98,10 @@ async def inspect(browser,site):
     def request_failed(req):
         failures.append({'method':req.method,'type':req.resource_type,'url':scrub_url(req.url),'failure':str(req.failure)[:180]})
     def page_error(err):
-        console_errors.append({'kind':'pageerror','message':str(err)[:350]})
+        console_errors.append({'kind':'pageerror','error_type':type(err).__name__,'message':re.sub(r'https?://\S+','[URL]',str(err))[:200]})
     def console_hook(msg):
         if msg.type=='error':
-            console_errors.append({'kind':'console','message':msg.text[:350]})
+            console_errors.append({'kind':'console','message':re.sub(r'https?://\S+','[URL]',msg.text)[:200]})
     page.on('response',response_hook)
     page.on('requestfailed',request_failed)
     page.on('pageerror',page_error)
@@ -105,6 +138,7 @@ async def inspect(browser,site):
             return result
         log('initial URL: '+page.url)
         await snapshot('01_initial')
+        await runtime_probe('initial')
         # The saved Kakao DOM contains a clickable product button, not a clickable "상세보기" span.
         # Select the personal product button by its own title; never click the group ticket.
         product=page.locator('button.product_ticket').filter(has=page.locator('.tit_product',has_text=re.compile(r'입장권\s*\(개인\)')))
@@ -122,6 +156,7 @@ async def inspect(browser,site):
         await page.wait_for_timeout(5000)
         log('after personal click URL: '+page.url)
         await snapshot('02_personal_detail')
+        await runtime_probe('after_personal_click')
         # Kakao's client-side transition may display a blank ticket page in headless Chromium.
         # Retry the known ticket URL as a full document navigation, then reload if necessary.
         detail_url=page.url
@@ -141,12 +176,14 @@ async def inspect(browser,site):
             await page.wait_for_timeout(3000)
             loaded=await calendar_loaded()
             await snapshot('03_direct_ticket')
+            await runtime_probe('direct_ticket')
         if not loaded:
             log('calendar missing after direct navigation; reload once')
             await page.reload(wait_until='domcontentloaded',timeout=30000)
             await page.wait_for_timeout(3000)
             loaded=await calendar_loaded()
             await snapshot('04_reloaded_ticket')
+            await runtime_probe('reloaded_ticket')
         if not loaded:
             log('calendar unavailable after all attempts; title='+repr(await page.title())+' body='+repr((await page.locator('body').inner_text())[:300]))
             result['reason']='개인 입장권 상세 주소에 도착했으나 달력이 로딩되지 않았습니다. 네트워크/JS 진단 파일 확인 필요.'
@@ -158,6 +195,7 @@ async def inspect(browser,site):
             result['reason']='감시 날짜 형식 오류 (YYYY-MM-DD)';return result
         text=await page.locator('body').inner_text(timeout=10000)
         await snapshot('05_calendar_loaded')
+        await runtime_probe('calendar_loaded')
         log('calendar heading found')
         # Navigate only if the displayed month can be unambiguously identified.
         # Do not click guessed next-month buttons: that could silently inspect a wrong month.
@@ -208,34 +246,15 @@ async def inspect(browser,site):
         log('ERROR: '+repr(e))
         await snapshot('error')
     finally:
-        # Discover literal API paths in already-loaded public JS bundles. No page data,
-        # cookies, tokens, or arbitrary JS source is written to diagnostics.
-        try:
-            scripts=await page.locator('script[src]').evaluate_all('(els) => els.map(e => e.src).filter(Boolean)')
-            script_urls=[u for u in dict.fromkeys(scripts) if urllib.parse.urlsplit(u).netloc in ('t1.kakaocdn.net','booking.kakao.com')][:100]
-            async def scan_script(u):
-                try:
-                    resp=await context.request.get(u,timeout=9000)
-                    if resp.status!=200:return
-                    body=await resp.text()
-                    if len(body)>4000000:return
-                    # Find only path literals: exclude query strings and variable values.
-                    found=set(re.findall(r'/api/(?:[A-Za-z0-9_./-]{3,180})',body))
-                    found={v.rstrip('\\') for v in found if interesting.search(v)}
-                    for v in found:
-                        if '?' not in v and '#' not in v:discovered_paths.add(v)
-                    if found:script_discoveries.append({'script':scrub_url(u),'api_path_count':len(found)})
-                except Exception:pass
-            await asyncio.gather(*(scan_script(u) for u in script_urls[-65:]))
-        except Exception as e:
-            trace.append('JS path scan: '+type(e).__name__)
+        # v1.7 bundle path scan found only irrelevant paths; prioritize runtime diagnosis.
+        await runtime_probe('final')
         result['final_url']=page.url
         result['diagnostics']=key
         (DIAG/(key+'_trace.json')).write_text(json.dumps(trace,ensure_ascii=False,indent=2),encoding='utf-8')
         # Diagnostics: request paths/statuses and JSON key names/types only; never bodies, cookies or query strings.
         if pending:
             await asyncio.gather(*pending,return_exceptions=True)
-        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-50:],'candidate_api_paths':sorted(discovered_paths)[:300],'script_discoveries':script_discoveries[:80]}
+        report={'final_url':scrub_url(page.url),'requests':network[-300:],'failed_requests':failures[-100:],'javascript_errors':console_errors[-100:],'public_ticket_api_shapes':api_shapes[-50:],'candidate_api_paths':sorted(discovered_paths)[:300],'script_discoveries':script_discoveries[:80], 'runtime_snapshots':runtime_snapshots}
         (DIAG/(key+'_network.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         log(f'network diagnostic: {len(network)} responses, {len(failures)} failed requests, {len(console_errors)} JS/console errors')
         await context.close()
